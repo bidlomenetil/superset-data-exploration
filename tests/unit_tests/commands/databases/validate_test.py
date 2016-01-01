@@ -1,0 +1,1113 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import pytest
+from pytest_mock import MockerFixture
+
+from superset.commands.database.exceptions import (
+    DatabaseOfflineError,
+    DatabaseTestConnectionFailedError,
+    InvalidParametersError,
+)
+from superset.commands.database.validate import ValidateDatabaseParametersCommand
+from superset.constants import PASSWORD_MASK
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
+from superset.utils import json
+
+
+def test_command(mocker: MockerFixture) -> None:
+    """
+    Test the happy path of the command.
+    """
+    user = mocker.MagicMock()
+    user.email = "alice@example.org"
+    mocker.patch("superset.db_engine_specs.gsheets.g", user=user)
+    mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+
+    DatabaseDAO = mocker.patch("superset.commands.database.validate.DatabaseDAO")  # noqa: N806
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    properties = {
+        "engine": "gsheets",
+        "driver": "gsheets",
+        "catalog": {"test": "https://example.org/"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    command.run()
+
+
+def test_command_invalid(mocker: MockerFixture) -> None:
+    """
+    Test the command when the payload is invalid.
+    """
+    user = mocker.MagicMock()
+    user.email = "alice@example.org"
+    mocker.patch("superset.db_engine_specs.gsheets.g", user=user)
+    mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+
+    DatabaseDAO = mocker.patch("superset.commands.database.validate.DatabaseDAO")  # noqa: N806
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    properties = {
+        "engine": "gsheets",
+        "driver": "gsheets",
+        "catalog": {"": "https://example.org/"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    assert excinfo.value.errors == [
+        SupersetError(
+            message="Sheet name is required",
+            error_type=SupersetErrorType.CONNECTION_MISSING_PARAMETERS_ERROR,
+            level=ErrorLevel.WARNING,
+            extra={
+                "catalog": {"idx": 0, "name": True},
+                "issue_codes": [
+                    {
+                        "code": 1018,
+                        "message": (
+                            "Issue 1018 - One or more parameters needed to configure a "
+                            "database are missing."
+                        ),
+                    }
+                ],
+            },
+        )
+    ]
+
+
+def test_command_no_ping(mocker: MockerFixture) -> None:
+    """
+    Test the command when it can't ping the database.
+    """
+    user = mocker.MagicMock()
+    user.email = "alice@example.org"
+    mocker.patch("superset.db_engine_specs.gsheets.g", user=user)
+    mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = False
+
+    DatabaseDAO = mocker.patch("superset.commands.database.validate.DatabaseDAO")  # noqa: N806
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    properties = {
+        "engine": "gsheets",
+        "driver": "gsheets",
+        "catalog": {"test": "https://example.org/"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(DatabaseOfflineError) as excinfo:
+        command.run()
+    assert excinfo.value.error == SupersetError(
+        message="Database is offline.",
+        error_type=SupersetErrorType.GENERIC_DB_ENGINE_ERROR,
+        level=ErrorLevel.ERROR,
+        extra={
+            "issue_codes": [
+                {
+                    "code": 1002,
+                    "message": "Issue 1002 - The database returned an unexpected error.",  # noqa: E501
+                }
+            ]
+        },
+    )
+
+
+def test_command_with_oauth2(mocker: MockerFixture) -> None:
+    """
+    Test the command when OAuth2 is needed.
+    """
+    user = mocker.MagicMock()
+    user.email = "alice@example.org"
+    mocker.patch("superset.db_engine_specs.gsheets.g", user=user)
+    mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    database.db_engine_spec.needs_oauth2.return_value = True
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.side_effect = Exception("OAuth2 needed")
+
+    DatabaseDAO = mocker.patch("superset.commands.database.validate.DatabaseDAO")  # noqa: N806
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    properties = {
+        "engine": "gsheets",
+        "driver": "gsheets",
+        "catalog": {"test": "https://example.org/"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    command.run()
+
+
+def test_command_with_oauth2_not_configured(mocker: MockerFixture) -> None:
+    """
+    Test the command when OAuth2 is needed but not configured in the DB.
+    """
+    user = mocker.MagicMock()
+    user.email = "alice@example.org"
+    mocker.patch("superset.db_engine_specs.gsheets.g", user=user)
+    mocker.patch("superset.db_engine_specs.gsheets.create_engine")
+
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = False
+    database.db_engine_spec.needs_oauth2.return_value = True
+    database.db_engine_spec.extract_errors.return_value = [
+        SupersetError(
+            error_type=SupersetErrorType.GENERIC_DB_ENGINE_ERROR,
+            message="OAuth2 is needed but not configured.",
+            level=ErrorLevel.ERROR,
+            extra={"engine_name": "gsheets"},
+        )
+    ]
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.side_effect = Exception("OAuth2 needed")
+
+    DatabaseDAO = mocker.patch("superset.commands.database.validate.DatabaseDAO")  # noqa: N806
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    properties = {
+        "engine": "gsheets",
+        "driver": "gsheets",
+        "catalog": {"test": "https://example.org/"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(DatabaseTestConnectionFailedError) as excinfo:
+        command.run()
+    assert excinfo.value.errors == [
+        SupersetError(
+            error_type=SupersetErrorType.GENERIC_DB_ENGINE_ERROR,
+            message="OAuth2 is needed but not configured.",
+            level=ErrorLevel.ERROR,
+            extra={"engine_name": "gsheets"},
+        )
+    ]
+
+
+def test_command_duplicate_database_name(mocker: MockerFixture) -> None:
+    """
+    Validation surfaces a duplicate-name error for a new database with a
+    name already in use.
+    """
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.validate_uniqueness.return_value = False
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+        ),
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "database_name": "duplicate",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    assert any(
+        err.error_type == SupersetErrorType.INVALID_PAYLOAD_SCHEMA_ERROR
+        and err.extra is not None
+        and err.extra.get("invalid") == ["database_name"]
+        for err in excinfo.value.errors
+    )
+
+
+def test_command_duplicate_database_name_on_update(mocker: MockerFixture) -> None:
+    """
+    Validation uses ``validate_update_uniqueness`` when an ``id`` is provided.
+    """
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.find_by_id.return_value = mocker.MagicMock()
+    DatabaseDAO.validate_update_uniqueness.return_value = False
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+        ),
+    )
+
+    properties = {
+        "id": 1,
+        "engine": "postgresql",
+        "database_name": "existing",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError):
+        command.run()
+    DatabaseDAO.validate_update_uniqueness.assert_called_once_with(1, "existing")
+
+
+def test_command_duplicate_database_name_bypass_engine(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Bypass engines (e.g. ``bigquery``) still validate database name uniqueness.
+    """
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.validate_uniqueness.return_value = False
+
+    properties = {
+        "engine": "bigquery",
+        "database_name": "duplicate",
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    assert excinfo.value.errors[0].error_type == (
+        SupersetErrorType.INVALID_PAYLOAD_SCHEMA_ERROR
+    )
+
+
+def test_validate_ssh_tunnel_feature_disabled(mocker: MockerFixture) -> None:
+    """
+    Enabling SSH tunnel without the feature flag surfaces a field-level
+    SupersetError tagged with ``ssh_tunnel`` so the modal can map it back
+    to the SSH tunnel section instead of throwing a hard 400 toast.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=False,
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "ssh_tunnel": {"server_address": "localhost"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    assert any(
+        err.extra is not None and err.extra.get("ssh_tunnel") is True
+        for err in excinfo.value.errors
+    )
+
+
+def test_validate_ssh_tunnel_missing_db_port(mocker: MockerFixture) -> None:
+    """
+    SSH tunneling requires a database port; the error is surfaced via the
+    top-level ``missing`` extra so it lands on the database port input.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+        ),
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "ssh_tunnel": {"server_address": "localhost"},
+        "parameters": {"host": "localhost"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    assert any(
+        err.extra is not None
+        and "port" in (err.extra.get("missing") or [])
+        and not err.extra.get("ssh_tunnel")
+        for err in excinfo.value.errors
+    )
+
+
+def test_get_ssh_tunnel_errors_missing_required_fields(
+    mocker: MockerFixture,
+) -> None:
+    """
+    SSH tunnel collects missing required fields (server_address, server_port,
+    username) and missing credentials.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+        ),
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+        "ssh_tunnel": {"server_address": "ssh.example.com"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+
+    assert any(
+        err.extra is not None
+        and err.extra.get("ssh_tunnel") is True
+        and err.extra.get("missing") == ["server_port", "username"]
+        for err in excinfo.value.errors
+    )
+    assert any(
+        err.extra is not None
+        and err.extra.get("ssh_tunnel") is True
+        and err.extra.get("missing") == ["password", "private_key"]
+        for err in excinfo.value.errors
+    )
+
+
+def test_get_ssh_tunnel_errors_unencrypted_private_key_is_valid(
+    mocker: MockerFixture,
+) -> None:
+    """
+    An unencrypted private key (no ``private_key_password``) is a valid
+    SSH tunnel credential — validation should not flag it as missing.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.validate_uniqueness.return_value = True
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            build_sqlalchemy_uri=mocker.MagicMock(return_value="postgresql://"),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+        "ssh_tunnel": {
+            "server_address": "ssh.example.com",
+            "server_port": 22,
+            "username": "ssh-user",
+            "private_key": "----- KEY -----",
+        },
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    command.run()
+
+
+def test_ssh_tunnel_forwarded_to_connection_test(
+    mocker: MockerFixture,
+) -> None:
+    """
+    The SSH tunnel payload is forwarded into the connection test so
+    tunnel-only databases are reached through the tunnel rather than
+    pinged directly.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.validate_uniqueness.return_value = True
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            build_sqlalchemy_uri=mocker.MagicMock(return_value="postgresql://"),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    ssh_tunnel = {
+        "server_address": "ssh.example.com",
+        "server_port": 22,
+        "username": "ssh-user",
+        "password": "secret",
+    }
+    properties = {
+        "engine": "postgresql",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+        "ssh_tunnel": ssh_tunnel,
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    command.run()
+
+    DatabaseDAO.build_db_for_connection_test.assert_called_once()
+    assert (
+        DatabaseDAO.build_db_for_connection_test.call_args.kwargs["ssh_tunnel"]
+        == ssh_tunnel
+    )
+
+
+def test_ssh_tunnel_unmasked_when_only_engine_params_changed(
+    mocker: MockerFixture,
+) -> None:
+    """
+    An unrelated `extra.engine_params` change must not block reattaching
+    the stored SSH tunnel password when the tunnel's own endpoint is
+    unchanged -- gating the tunnel unmask on the combined identity flag
+    (rather than the tunnel's own endpoint check) would spuriously fail a
+    perfectly legitimate connection test.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+
+    tunnel = mocker.MagicMock()
+    tunnel.server_address = "ssh.example.com"
+    tunnel.server_port = 22
+    tunnel.password = "real-tunnel-secret"  # noqa: S105
+
+    existing = mocker.MagicMock()
+    existing.safe_sqlalchemy_uri.return_value = "postgresql://u:XXXXXXXXXX@host1/d"
+    existing.sqlalchemy_uri_decrypted = "postgresql://u:realpass@host1/d"
+    existing.encrypted_extra = "{}"
+    existing.extra = "{}"
+    existing.ssh_tunnel = tunnel
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.find_by_id.return_value = existing
+    DatabaseDAO.validate_update_uniqueness.return_value = True
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            # a fresh (non-masked) password, as if the user supplied the
+            # real one for the main connection -- this is the legitimate
+            # path that gets past the main URI-identity check below
+            build_sqlalchemy_uri=mocker.MagicMock(
+                return_value="postgresql://u:realpass@host1/d"
+            ),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    properties = {
+        "id": 1,
+        "engine": "postgresql",
+        "parameters": {
+            "host": "host1",
+            "port": 5432,
+            "username": "u",
+            "password": "realpass",
+            "database": "d",
+        },
+        # unrelated to the tunnel, but still an identity-affecting change
+        "extra": json.dumps(
+            {"engine_params": {"connect_args": {"connect_timeout": 30}}}
+        ),
+        "ssh_tunnel": {
+            "server_address": "ssh.example.com",
+            "server_port": 22,
+            "username": "tunnel_user",
+            "password": PASSWORD_MASK,
+        },
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    command.run()
+
+    forwarded_tunnel = DatabaseDAO.build_db_for_connection_test.call_args.kwargs[
+        "ssh_tunnel"
+    ]
+    assert forwarded_tunnel["password"] == "real-tunnel-secret"  # noqa: S105
+
+
+def test_get_ssh_tunnel_errors_skipped_when_parameters_ssh_false(
+    mocker: MockerFixture,
+) -> None:
+    """
+    An explicit ``parameters.ssh == False`` is authoritative and skips SSH
+    tunnel validation even when a stale ``ssh_tunnel`` object is still in
+    the payload — otherwise toggling SSH off after partial entry would
+    leave hidden validation errors blocking save.
+    """
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.validate_uniqueness.return_value = True
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            build_sqlalchemy_uri=mocker.MagicMock(return_value="postgresql://"),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "database_name": "ok",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+            "ssh": False,
+        },
+        # Stale partial tunnel payload from before the user toggled off:
+        "ssh_tunnel": {"server_address": "ssh.example.com"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    command.run()
+
+
+def test_get_ssh_tunnel_errors_skipped_when_not_enabled(
+    mocker: MockerFixture,
+) -> None:
+    """
+    SSH tunnel validation is a no-op when ssh is not enabled and no tunnel
+    is provided.
+    """
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.validate_uniqueness.return_value = True
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            build_sqlalchemy_uri=mocker.MagicMock(return_value="postgresql://"),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "database_name": "ok",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    command.run()
+
+
+def test_bypass_engine_surfaces_ssh_tunnel_errors(mocker: MockerFixture) -> None:
+    """
+    Bypass engines also surface SSH tunnel field errors so the progressive
+    validation flow stays consistent across engine types.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.validate_uniqueness.return_value = True
+
+    properties = {
+        "engine": "snowflake",
+        "database_name": "ok",
+        "parameters": {"port": 443},
+        "ssh_tunnel": {"server_address": "ssh.example.com"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    assert any(
+        err.extra is not None and err.extra.get("ssh_tunnel") is True
+        for err in excinfo.value.errors
+    )
+
+
+def test_validate_ssh_tunnel_feature_disabled_via_parameters_ssh(
+    mocker: MockerFixture,
+) -> None:
+    """
+    The SSH feature-flag guard fires when the UI marks ``parameters.ssh``
+    even if ``ssh_tunnel`` itself is empty during progressive validation.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=False,
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "parameters": {"host": "localhost", "port": 5432, "ssh": True},
+        "ssh_tunnel": {},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    assert any(
+        err.extra is not None and err.extra.get("ssh_tunnel") is True
+        for err in excinfo.value.errors
+    )
+
+
+def test_validate_engine_params_change_requires_new_credentials(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Validating an existing database's parameters (unchanged host/port/etc,
+    so `sqlalchemy_uri` matches the stored masked URI) must not silently
+    reuse the stored password when `extra.engine_params` would redirect the
+    actual DBAPI connect kwargs elsewhere.
+    """
+    existing = mocker.MagicMock()
+    existing.safe_sqlalchemy_uri.return_value = "postgresql://u:XXXXXXXXXX@host1/d"
+    existing.sqlalchemy_uri_decrypted = "postgresql://u:realpass@host1/d"
+    existing.encrypted_extra = "{}"
+    existing.extra = "{}"
+    existing.ssh_tunnel = None
+
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.find_by_id.return_value = existing
+    DatabaseDAO.validate_update_uniqueness.return_value = True
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            build_sqlalchemy_uri=mocker.MagicMock(
+                return_value="postgresql://u:XXXXXXXXXX@host1/d"
+            ),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    properties = {
+        "id": 1,
+        "engine": "postgresql",
+        "parameters": {
+            "host": "host1",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+        "extra": json.dumps(
+            {
+                "engine_params": {
+                    "connect_args": {"host": "attacker.example.com", "port": 15432}
+                }
+            }
+        ),
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError):
+        command.run()
+
+    DatabaseDAO.build_db_for_connection_test.assert_not_called()
+
+
+def test_validate_ssh_tunnel_host_change_requires_new_credentials(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Validating with an unchanged host/parameters set must not silently
+    reuse the stored SSH tunnel password when the tunnel endpoint itself
+    is being redirected.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+
+    tunnel = mocker.MagicMock()
+    tunnel.server_address = "10.0.0.1"
+    tunnel.server_port = 22
+
+    existing = mocker.MagicMock()
+    existing.safe_sqlalchemy_uri.return_value = "postgresql://u:XXXXXXXXXX@host1/d"
+    existing.sqlalchemy_uri_decrypted = "postgresql://u:realpass@host1/d"
+    existing.encrypted_extra = "{}"
+    existing.extra = "{}"
+    existing.ssh_tunnel = tunnel
+
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.find_by_id.return_value = existing
+    DatabaseDAO.validate_update_uniqueness.return_value = True
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            build_sqlalchemy_uri=mocker.MagicMock(
+                return_value="postgresql://u:XXXXXXXXXX@host1/d"
+            ),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    properties = {
+        "id": 1,
+        "engine": "postgresql",
+        "parameters": {
+            "host": "host1",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+        "ssh_tunnel": {
+            "server_address": "attacker.example.com",
+            "server_port": 22,
+            "username": "tunnel_user",
+            "password": PASSWORD_MASK,
+        },
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError):
+        command.run()
+
+    DatabaseDAO.build_db_for_connection_test.assert_not_called()
+
+
+def test_ssh_tunnel_missing_message_is_interpolated(
+    mocker: MockerFixture,
+) -> None:
+    """
+    The translated ``parameters are missing`` message is interpolated with
+    the actual missing fields rather than the raw ``%(missing)s`` token.
+    """
+    mocker.patch(
+        "superset.commands.database.validate.is_feature_enabled",
+        return_value=True,
+    )
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+        ),
+    )
+
+    properties = {
+        "engine": "postgresql",
+        "parameters": {
+            "host": "localhost",
+            "port": 5432,
+            "username": "u",
+            "database": "d",
+        },
+        "ssh_tunnel": {"server_address": "ssh.example.com"},
+    }
+    command = ValidateDatabaseParametersCommand(properties)
+    with pytest.raises(InvalidParametersError) as excinfo:
+        command.run()
+    missing_field_messages = [
+        err.message
+        for err in excinfo.value.errors
+        if err.extra is not None
+        and err.extra.get("missing")
+        and err.extra.get("ssh_tunnel")  # noqa: E501
+    ]
+    assert missing_field_messages
+    assert all("%(missing)s" not in msg for msg in missing_field_messages)
+    assert any("server_port" in msg for msg in missing_field_messages)
+
+
+@pytest.mark.parametrize(
+    "rebuilt_uri, expected_uri",
+    [
+        # unchanged native-form fields: the stored token is rehydrated
+        (
+            "databricks://token:XXXXXXXXXX@host:443"
+            "?catalog=main&http_path=%2Flegacy&schema=default",
+            "databricks://token:real-token@host:443/default",
+        ),
+        # a different warehouse requires a freshly entered token
+        (
+            "databricks://token:XXXXXXXXXX@host:443"
+            "?catalog=main&http_path=%2Fother&schema=default",
+            "databricks://token:XXXXXXXXXX@host:443"
+            "?catalog=main&http_path=%2Fother&schema=default",
+        ),
+        # a newly typed token is used as typed
+        (
+            "databricks://token:new-token@host:443"
+            "?catalog=main&http_path=%2Flegacy&schema=default",
+            "databricks://token:new-token@host:443"
+            "?catalog=main&http_path=%2Flegacy&schema=default",
+        ),
+    ],
+)
+def test_validate_converted_databricks_connection_token(
+    mocker: MockerFixture, rebuilt_uri: str, expected_uri: str
+) -> None:
+    """
+    A converted Databricks connection keeps legacy settings in ``connect_args``
+    while the native form rebuilds them into the URI query. Validation must
+    still test an unchanged connection with its stored token.
+    """
+    extra = json.dumps(
+        {"engine_params": {"connect_args": {"http_path": "/legacy", "catalog": "main"}}}
+    )
+    existing = mocker.MagicMock()
+    existing.safe_sqlalchemy_uri.return_value = (
+        "databricks://token:XXXXXXXXXX@host:443/default"
+    )
+    existing.sqlalchemy_uri_decrypted = "databricks://token:real-token@host:443/default"
+    existing.encrypted_extra = "{}"
+    existing.extra = extra
+    existing.ssh_tunnel = None
+
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+
+    DatabaseDAO = mocker.patch(  # noqa: N806
+        "superset.commands.database.validate.DatabaseDAO"
+    )
+    DatabaseDAO.find_by_id.return_value = existing
+    DatabaseDAO.validate_update_uniqueness.return_value = True
+    DatabaseDAO.build_db_for_connection_test.return_value = database
+
+    mocker.patch(
+        "superset.commands.database.validate.get_engine_spec",
+        return_value=mocker.MagicMock(
+            validate_parameters=mocker.MagicMock(return_value=[]),
+            get_extra_from_parameters=lambda parameters, extra: extra,
+            build_sqlalchemy_uri=mocker.MagicMock(return_value=rebuilt_uri),
+            unmask_encrypted_extra=mocker.MagicMock(return_value="{}"),
+        ),
+    )
+
+    properties = {
+        "id": 1,
+        "engine": "databricks",
+        "driver": "databricks",
+        "parameters": {"host": "host", "port": 443},
+        "extra": extra,
+    }
+    if "XXXXXXXXXX" in expected_uri:
+        with pytest.raises(InvalidParametersError, match="Re-enter the access token"):
+            ValidateDatabaseParametersCommand(properties).run()
+        database.set_sqlalchemy_uri.assert_not_called()
+    else:
+        ValidateDatabaseParametersCommand(properties).run()
+        database.set_sqlalchemy_uri.assert_called_once_with(expected_uri)
+
+
+def test_validate_converted_databricks_without_catalog(mocker: MockerFixture) -> None:
+    """An unchanged converted row uses real field validation and its stored token."""
+    from superset.models.core import Database
+
+    extra = json.dumps(
+        {
+            "migrated_from_databricks_connector_uri": True,
+            "engine_params": {"connect_args": {"http_path": "/legacy"}},
+        }
+    )
+    existing = Database(extra=extra)
+    existing.set_sqlalchemy_uri("databricks://token:test-token@host:443/default")
+    mocker.patch(
+        "superset.commands.database.validate.DatabaseDAO.find_by_id",
+        return_value=existing,
+    )
+    mocker.patch(
+        "superset.db_engine_specs.databricks.is_hostname_valid", return_value=True
+    )
+    mocker.patch("superset.db_engine_specs.databricks.is_port_open", return_value=True)
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+    mocker.patch(
+        "superset.commands.database.validate.DatabaseDAO.build_db_for_connection_test",
+        return_value=database,
+    )
+    ValidateDatabaseParametersCommand(
+        {
+            "id": 1,
+            "engine": "databricks",
+            "driver": "databricks-sql-python",
+            "parameters": existing.parameters,
+            "extra": extra,
+        }
+    ).run()
+    database.set_sqlalchemy_uri.assert_called_once_with(
+        existing.sqlalchemy_uri_decrypted
+    )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("host", "other-host"), ("port", 444), ("http_path_field", "/other")],
+)
+def test_validate_databricks_destination_change_requires_fresh_token(
+    mocker: MockerFixture,
+    field: str,
+    value: str | int,
+) -> None:
+    """Never send a password mask to a changed Databricks destination."""
+    from superset.models.core import Database
+
+    existing = Database(
+        extra='{"engine_params":{"connect_args":{"http_path":"/legacy"}}}'
+    )
+    existing.set_sqlalchemy_uri("databricks://token:test-token@host:443/default")
+    mocker.patch(
+        "superset.commands.database.validate.DatabaseDAO.find_by_id",
+        return_value=existing,
+    )
+    mocker.patch(
+        "superset.db_engine_specs.databricks.is_hostname_valid", return_value=True
+    )
+    mocker.patch("superset.db_engine_specs.databricks.is_port_open", return_value=True)
+    build = mocker.patch(
+        "superset.commands.database.validate.DatabaseDAO.build_db_for_connection_test"
+    )
+    parameters = {**existing.parameters, field: value}
+    with pytest.raises(InvalidParametersError, match="Re-enter the access token"):
+        ValidateDatabaseParametersCommand(
+            {
+                "id": 1,
+                "engine": "databricks",
+                "driver": "databricks-sql-python",
+                "parameters": parameters,
+                "extra": existing.extra,
+            }
+        ).run()
+    build.assert_not_called()
+
+
+def test_validate_legacy_databricks_form_keeps_masked_token(
+    mocker: MockerFixture,
+) -> None:
+    """An unconverted saved form preserves its driver and stored credential."""
+    from superset.models.core import Database
+
+    existing = Database(
+        extra='{"engine_params":{"connect_args":{"http_path":"/legacy"}}}'
+    )
+    existing.set_sqlalchemy_uri(
+        "databricks+connector://token:test-token@host:443/default"
+    )
+    mocker.patch(
+        "superset.commands.database.validate.DatabaseDAO.find_by_id",
+        return_value=existing,
+    )
+    mocker.patch(
+        "superset.db_engine_specs.databricks.is_hostname_valid", return_value=True
+    )
+    mocker.patch("superset.db_engine_specs.databricks.is_port_open", return_value=True)
+    database = mocker.MagicMock()
+    with database.get_sqla_engine() as engine:
+        engine.dialect.do_ping.return_value = True
+    mocker.patch(
+        "superset.commands.database.validate.DatabaseDAO.build_db_for_connection_test",
+        return_value=database,
+    )
+    ValidateDatabaseParametersCommand(
+        {
+            "id": 1,
+            "engine": "databricks",
+            "driver": "connector",
+            "parameters": existing.parameters,
+            "extra": existing.extra,
+        }
+    ).run()
+    database.set_sqlalchemy_uri.assert_called_once_with(
+        existing.sqlalchemy_uri_decrypted
+    )

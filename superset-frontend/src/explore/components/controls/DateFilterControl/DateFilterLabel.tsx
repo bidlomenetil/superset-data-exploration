@@ -1,0 +1,447 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { ReactNode, useState, useEffect, useMemo, useRef } from 'react';
+import { t } from '@apache-superset/core/translation';
+import {
+  NO_TIME_RANGE,
+  useCSSTextTruncation,
+  fetchTimeRange,
+} from '@superset-ui/core';
+import {
+  css,
+  styled,
+  useTheme,
+  SupersetTheme,
+} from '@apache-superset/core/theme';
+import {
+  Button,
+  Constants,
+  Divider,
+  Tooltip,
+  Select,
+  Flex,
+} from '@superset-ui/core/components';
+import ControlHeader from 'src/explore/components/ControlHeader';
+import PartitionPruningIndicator from 'src/explore/components/PartitionPruningIndicator';
+import { Icons } from '@superset-ui/core/components/Icons';
+import { useDebouncedEffect } from 'src/explore/exploreUtils';
+import { noOp } from 'src/utils/common';
+import ControlPopover from '../ControlPopover/ControlPopover';
+
+import { DateFilterControlProps, FrameType } from './types';
+import {
+  DateFilterTestKey,
+  FRAME_OPTIONS,
+  guessFrame,
+  useDefaultTimeFilter,
+} from './utils';
+import {
+  CommonFrame,
+  CalendarFrame,
+  CustomFrame,
+  AdvancedFrame,
+  DateLabel,
+} from './components';
+import { CurrentCalendarFrame } from './components/CurrentCalendarFrame';
+
+const StyledRangeType = styled(Select)`
+  width: 272px;
+`;
+
+const ContentStyleWrapper = styled.div`
+  ${({ theme }) => css`
+    .ant-row {
+      margin-top: 8px;
+    }
+
+    .ant-picker {
+      padding: 4px 17px 4px;
+      border-radius: 4px;
+    }
+
+    .ant-divider-horizontal {
+      margin: 16px 0;
+    }
+
+    .control-label {
+      font-size: ${theme.fontSizeSM}px;
+      line-height: 16px;
+      margin: 8px 0;
+    }
+
+    .section-title {
+      font-style: normal;
+      font-weight: ${theme.fontWeightStrong};
+      font-size: 15px;
+      line-height: 24px;
+      margin-bottom: 8px;
+    }
+
+    .control-anchor-to {
+      margin-top: 16px;
+    }
+
+    .control-anchor-to-datetime {
+      width: 217px;
+    }
+
+    .footer {
+      text-align: right;
+    }
+  `}
+`;
+
+const IconWrapper = styled.span`
+  span {
+    margin-right: ${({ theme }) => 2 * theme.sizeUnit}px;
+    vertical-align: middle;
+  }
+  .text {
+    vertical-align: middle;
+  }
+  .error {
+    color: ${({ theme }) => theme.colorError};
+  }
+`;
+
+const getTooltipTitle = (
+  isLabelTruncated: boolean,
+  label: string | undefined,
+  range: string | undefined,
+) =>
+  isLabelTruncated ? (
+    <div>
+      {label && <strong>{t(label)}</strong>}
+      {range && (
+        <div
+          css={(theme: SupersetTheme) => css`
+            margin-top: ${theme.sizeUnit}px;
+          `}
+        >
+          {range}
+        </div>
+      )}
+    </div>
+  ) : (
+    range || null
+  );
+
+export default function DateFilterLabel(props: DateFilterControlProps) {
+  const {
+    name,
+    onChange,
+    onOpenPopover = noOp,
+    onClosePopover = noOp,
+    isOverflowingFilterBar = false,
+    hovered: isControlHovered = false,
+    displayFormat,
+  } = props;
+  const defaultTimeFilter = useDefaultTimeFilter();
+
+  const value = props.value ?? defaultTimeFilter;
+  const [actualTimeRange, setActualTimeRange] = useState<string>(value);
+
+  const [show, setShow] = useState<boolean>(false);
+  const guessedFrame = useMemo(() => guessFrame(value), [value]);
+  const [frame, setFrame] = useState<FrameType>(guessedFrame);
+  const [lastFetchedTimeRange, setLastFetchedTimeRange] = useState(value);
+  const [timeRangeValue, setTimeRangeValue] = useState(value);
+  const [validTimeRange, setValidTimeRange] = useState<boolean>(false);
+  const [evalResponse, setEvalResponse] = useState<string>(value);
+  const [tooltipTitle, setTooltipTitle] = useState<ReactNode | null>(t(value));
+  const [isDescriptionHovered, setIsDescriptionHovered] = useState(false);
+  const theme = useTheme();
+  const [labelRef, labelIsTruncated] = useCSSTextTruncation<HTMLSpanElement>();
+  // Separate per-effect: each only guards against a later request from the
+  // *same* effect. A shared counter would let effect 2's debounced draft
+  // fetch (which can still be pending/leftover after Apply) invalidate
+  // effect 1's Apply-triggered fetch purely because it started later,
+  // even though effect 1's result is the more relevant one.
+  const latestValueRequestId = useRef(0);
+  const latestDraftRequestId = useRef(0);
+
+  useEffect(() => {
+    if (!isControlHovered) {
+      setIsDescriptionHovered(false);
+    }
+  }, [isControlHovered]);
+
+  useEffect(() => {
+    if (value === NO_TIME_RANGE) {
+      setActualTimeRange(NO_TIME_RANGE);
+      setTooltipTitle(null);
+      setValidTimeRange(true);
+      return;
+    }
+    latestValueRequestId.current += 1;
+    const requestId = latestValueRequestId.current;
+    fetchTimeRange(value, 'col', undefined, displayFormat).then(
+      ({ value: actualRange, error }) => {
+        if (requestId !== latestValueRequestId.current) return;
+        if (error) {
+          setEvalResponse(error || '');
+          setValidTimeRange(false);
+          setTooltipTitle(t(value) || null);
+        } else {
+          /*
+            HRT == human readable text
+            ADR == actual datetime range
+            +--------------+------+----------+--------+----------+-----------+
+            |              | Last | Previous | Custom | Advanced | No Filter |
+            +--------------+------+----------+--------+----------+-----------+
+            | control pill | HRT  | HRT      | ADR    | ADR      |   HRT     |
+            +--------------+------+----------+--------+----------+-----------+
+            | tooltip      | ADR  | ADR      | HRT    | HRT      |   ADR     |
+            +--------------+------+----------+--------+----------+-----------+
+          */
+          if (
+            guessedFrame === 'Common' ||
+            guessedFrame === 'Calendar' ||
+            guessedFrame === 'Current' ||
+            guessedFrame === 'No filter'
+          ) {
+            setActualTimeRange(value);
+            setTooltipTitle(
+              getTooltipTitle(labelIsTruncated, value, actualRange),
+            );
+          } else {
+            setActualTimeRange(actualRange || '');
+            setTooltipTitle(
+              getTooltipTitle(labelIsTruncated, actualRange, value),
+            );
+          }
+          setValidTimeRange(true);
+        }
+        setLastFetchedTimeRange(value);
+        setEvalResponse(actualRange || value);
+      },
+    );
+  }, [displayFormat, guessedFrame, labelIsTruncated, labelRef, value]);
+
+  useDebouncedEffect(
+    () => {
+      if (timeRangeValue === NO_TIME_RANGE) {
+        setEvalResponse(NO_TIME_RANGE);
+        setLastFetchedTimeRange(NO_TIME_RANGE);
+        setValidTimeRange(true);
+        return;
+      }
+      if (lastFetchedTimeRange !== timeRangeValue) {
+        latestDraftRequestId.current += 1;
+        const requestId = latestDraftRequestId.current;
+        fetchTimeRange(timeRangeValue, 'col', undefined, displayFormat).then(
+          ({ value: actualRange, error }) => {
+            if (requestId !== latestDraftRequestId.current) return;
+            if (error) {
+              setEvalResponse(error || '');
+              setValidTimeRange(false);
+            } else {
+              setEvalResponse(actualRange || '');
+              setValidTimeRange(true);
+            }
+            setLastFetchedTimeRange(timeRangeValue);
+          },
+        );
+      }
+    },
+    Constants.SLOW_DEBOUNCE,
+    [displayFormat, timeRangeValue],
+  );
+
+  function onSave() {
+    onChange(timeRangeValue);
+    setShow(false);
+    onClosePopover();
+  }
+
+  function onOpen() {
+    setTimeRangeValue(value);
+    setFrame(guessedFrame);
+    setShow(true);
+    onOpenPopover();
+  }
+
+  function onHide() {
+    setTimeRangeValue(value);
+    setFrame(guessedFrame);
+    setShow(false);
+    onClosePopover();
+  }
+
+  const toggleOverlay = () => {
+    if (show) {
+      onHide();
+    } else {
+      onOpen();
+    }
+  };
+
+  function onChangeFrame(value: FrameType) {
+    if (value === NO_TIME_RANGE) {
+      setTimeRangeValue(NO_TIME_RANGE);
+    }
+    setFrame(value);
+  }
+
+  const overlayContent = (
+    <ContentStyleWrapper>
+      <div className="control-label">{t('Range type')}</div>
+      <StyledRangeType
+        ariaLabel={t('Range type')}
+        options={FRAME_OPTIONS}
+        value={frame}
+        onChange={onChangeFrame}
+      />
+      {frame !== 'No filter' && <Divider />}
+      {frame === 'Common' && (
+        <CommonFrame value={timeRangeValue} onChange={setTimeRangeValue} />
+      )}
+      {frame === 'Calendar' && (
+        <CalendarFrame value={timeRangeValue} onChange={setTimeRangeValue} />
+      )}
+      {frame === 'Current' && (
+        <CurrentCalendarFrame
+          value={timeRangeValue}
+          onChange={setTimeRangeValue}
+        />
+      )}
+      {frame === 'Advanced' && (
+        <AdvancedFrame value={timeRangeValue} onChange={setTimeRangeValue} />
+      )}
+      {frame === 'Custom' && (
+        <CustomFrame
+          value={timeRangeValue}
+          onChange={setTimeRangeValue}
+          isOverflowingFilterBar={isOverflowingFilterBar}
+        />
+      )}
+      {frame === 'No filter' && <div data-test={DateFilterTestKey.NoFilter} />}
+      <Divider />
+      <div>
+        <div className="section-title">{t('Actual time range')}</div>
+        {validTimeRange && (
+          <div>
+            {evalResponse === 'No filter' ? t('No filter') : evalResponse}
+          </div>
+        )}
+        {!validTimeRange && (
+          <IconWrapper className="warning">
+            <Icons.ExclamationCircleOutlined iconColor={theme.colorError} />
+            <span className="text error">{evalResponse}</span>
+          </IconWrapper>
+        )}
+      </div>
+      <Divider />
+      <div className="footer">
+        <Button
+          buttonStyle="secondary"
+          cta
+          key="cancel"
+          onClick={onHide}
+          data-test={DateFilterTestKey.CancelButton}
+        >
+          {t('Cancel')}
+        </Button>
+        <Button
+          buttonStyle="primary"
+          cta
+          disabled={!validTimeRange}
+          key="apply"
+          onClick={onSave}
+          data-test={DateFilterTestKey.ApplyButton}
+        >
+          {t('Apply')}
+        </Button>
+      </div>
+    </ContentStyleWrapper>
+  );
+
+  const popoverContent = (
+    <ControlPopover
+      trigger="click"
+      placement="right"
+      content={overlayContent}
+      title={
+        <IconWrapper>
+          <Icons.EditOutlined />
+          <span className="text">{t('Edit time range')}</span>
+        </IconWrapper>
+      }
+      defaultOpen={show}
+      open={show}
+      onOpenChange={toggleOverlay}
+      overlayStyle={{ width: 'min(600px, calc(100vw - 32px))' }}
+      destroyOnHidden
+      getPopupContainer={() => document.body}
+      overlayClassName="time-range-popover"
+    >
+      <Tooltip
+        placement="top"
+        title={isDescriptionHovered ? null : tooltipTitle}
+        mouseLeaveDelay={0}
+        overlayStyle={{ pointerEvents: 'none' }}
+      >
+        {/* Wrap in a span so the Popover gets a stable DOM ref target;
+            DateLabel forwards its ref to an inner span used for measuring
+            text truncation, which would otherwise become the popover's
+            positioning anchor in React 18. */}
+        <span data-test={DateFilterTestKey.PopoverOverlay}>
+          <DateLabel
+            name={name}
+            aria-labelledby={`filter-name-${props.name}`}
+            aria-describedby={`date-label-${props.name}`}
+            label={actualTimeRange}
+            isActive={show}
+            isPlaceholder={actualTimeRange === NO_TIME_RANGE}
+            ref={labelRef}
+          />
+        </span>
+      </Tooltip>
+    </ControlPopover>
+  );
+
+  return (
+    <>
+      <ControlHeader
+        {...props}
+        onDescriptionHoverChange={setIsDescriptionHovered}
+      />
+      {/* The glyph sits outside the popover trigger so clicking it opens the
+          tooltip rather than the time-range editor. Only with a mapping: the
+          wrapper makes the trigger a flex item, so without one the markup stays
+          exactly what it was and the Time Range box keeps filling its
+          container. With one, the trigger is told to fill the row too. */}
+      {props.partitionMapping ? (
+        <Flex align="center" gap={theme.sizeUnit}>
+          <div
+            css={css`
+              flex: 1;
+              min-width: 0;
+            `}
+          >
+            {popoverContent}
+          </div>
+          <PartitionPruningIndicator mapping={props.partitionMapping} />
+        </Flex>
+      ) : (
+        popoverContent
+      )}
+    </>
+  );
+}

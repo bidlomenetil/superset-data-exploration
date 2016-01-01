@@ -1,0 +1,984 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import logging
+import uuid
+from collections import defaultdict, deque
+from collections.abc import Sequence
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+import sqlalchemy as sqla
+from flask import current_app as app, has_request_context, url_for
+from flask_appbuilder import Model
+from flask_appbuilder.models.decorators import renders
+from markupsafe import escape, Markup
+from sqlalchemy import (
+    Boolean,
+    Column,
+    ForeignKey,
+    Integer,
+    String,
+    Table,
+    Text,
+)
+from sqlalchemy.engine.base import Connection
+from sqlalchemy.orm import relationship, Session, subqueryload
+from sqlalchemy.orm.mapper import Mapper
+from sqlalchemy.sql.elements import BinaryExpression
+from superset_core.common.models import Dashboard as CoreDashboard
+
+from superset import db, is_feature_enabled, security_manager
+from superset.connectors.sqla.models import (
+    _authored_display_label,
+    _physical_display_column,
+    BaseDatasource,
+    SqlaTable,
+)
+from superset.daos.datasource import Datasource, DatasourceDAO
+from superset.models.helpers import (
+    AuditMixinNullable,
+    ImportExportMixin,
+    SoftDeleteMixin,
+)
+from superset.models.slice import Slice
+from superset.models.user_attributes import UserAttribute
+from superset.semantic_layers.access import (
+    is_semantic_layers_enabled,
+)
+from superset.semantic_layers.dimension_resolution import AmbiguousDimensionError
+from superset.semantic_layers.models import SemanticView
+from superset.subjects.models import (
+    dashboard_editors,
+    dashboard_viewers,
+    Subject,
+)
+from superset.tasks.thumbnails import cache_dashboard_thumbnail
+from superset.tasks.utils import get_current_user
+from superset.thumbnails.digest import get_dashboard_digest
+from superset.utils import core as utils, json
+
+if TYPE_CHECKING:
+    from superset.explorables.base import Explorable
+
+metadata = Model.metadata  # pylint: disable=no-member
+logger = logging.getLogger(__name__)
+
+
+def _copy_dashboard_for_user(
+    session: Session,
+    target: Any,
+    dashboard_id: int | str,
+) -> None:
+    """Copy the configured template dashboard to a newly created user.
+
+    Clones the template dashboard metadata and slices, associates the new user
+    as an editor and their groups as viewers, and configures the cloned dashboard
+    as the user's welcome dashboard.
+
+    :param session: The active SQLAlchemy session to use for queries and persistence.
+    :param target: The newly created user instance.
+    :param dashboard_id: The ID of the template dashboard to copy.
+    """
+    from superset.subjects.models import Subject
+    from superset.subjects.utils import (
+        get_default_viewers_for_groups,
+        get_user_subject,
+    )
+
+    def _rebind(subjects: Sequence[Subject | None]) -> list[Subject]:
+        """The helpers resolve subjects on ``db.session``; a persistent object
+        cannot be cascaded into a second session."""
+        ids = [s.id for s in subjects if s is not None]
+        return session.query(Subject).filter(Subject.id.in_(ids)).all() if ids else []
+
+    template = session.query(Dashboard).filter_by(id=int(dashboard_id)).first()
+    if not template:
+        return
+
+    editors = _rebind([get_user_subject(target.id)])
+    viewers = _rebind(
+        get_default_viewers_for_groups(list(getattr(target, "groups", []) or []))
+    )
+    dashboard = Dashboard(
+        dashboard_title=template.dashboard_title,
+        position_json=template.position_json,
+        description=template.description,
+        css=template.css,
+        json_metadata=template.json_metadata,
+        slices=template.slices,
+        editors=editors,
+        viewers=viewers,
+    )
+    session.add(dashboard)
+    session.flush()
+    extra_attributes = UserAttribute(
+        user_id=target.id, welcome_dashboard_id=dashboard.id
+    )
+    session.add(extra_attributes)
+    session.commit()  # pylint: disable=consider-using-transaction
+
+
+def copy_dashboard(_mapper: Mapper, _connection: Connection, target: Any) -> None:
+    """SQLAlchemy mapper event hook triggered on user creation (after_insert).
+
+    Creates a personal copy of the configured template dashboard for the user.
+    Uses an isolated session bound to the active transaction connection to avoid
+    SQLAlchemy FlushError or overlapping flush issues during the flush lifecycle.
+
+    :param _mapper: The SQLAlchemy mapper for the entity.
+    :param _connection: The active database connection for the event.
+    :param target: The user entity instance being inserted.
+    """
+    dashboard_id = app.config["DASHBOARD_TEMPLATE_ID"]
+    if dashboard_id is None:
+        return
+
+    with Session(bind=_connection) as session:  # pylint: disable=disallowed-name
+        _copy_dashboard_for_user(session, target, dashboard_id)
+
+
+def register_dashboard_copy_events(user_model: Any) -> None:
+    """Register the after_insert listener that copies dashboard templates for new users.
+
+    Dynamically attaches the listener to the active security manager user model,
+    supporting custom and extended user models. Idempotent across repeated calls.
+
+    :param user_model: The user model class to attach the event listener to.
+    """
+    if not sqla.event.contains(user_model, "after_insert", copy_dashboard):
+        sqla.event.listen(user_model, "after_insert", copy_dashboard)
+
+
+dashboard_slices = Table(
+    "dashboard_slices",
+    metadata,
+    Column(
+        "dashboard_id",
+        Integer,
+        ForeignKey("dashboards.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "slice_id",
+        Integer,
+        ForeignKey("slices.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    sqla.Index("ix_dashboard_slices_slice_id", "slice_id"),
+)
+
+
+def _configured_display_label(value: Any) -> str | None:
+    """Return a configured label, or ``None`` to keep the raw-name fallback."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _authored_adhoc_label(item: dict[str, Any]) -> str | None:
+    """Return an adhoc column/metric label only when its author set it.
+
+    A generated adhoc label can repeat the item's SQL expression or aggregated
+    physical column, so it is never echoed; the client derives that same text
+    from the chart's own form data.
+    """
+    return _authored_display_label(item)
+
+
+def _dataset_display_labels(
+    datasource: SqlaTable,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Index configured column and metric labels once per dataset payload."""
+    return (
+        {
+            column.column_name: label
+            for column in datasource.columns
+            if (label := _configured_display_label(column.verbose_name))
+        },
+        {
+            metric.metric_name: label
+            for metric in datasource.metrics
+            if (label := _configured_display_label(metric.verbose_name))
+        },
+    )
+
+
+def saved_chart_display_labels(
+    datasource: SqlaTable,
+    chart: Slice,
+    *,
+    configured_labels: tuple[dict[str, str], dict[str, str]] | None = None,
+) -> dict[str, str]:
+    """Map a chart's saved dimension/metric IDs to their configured labels.
+
+    Display references come from recognized saved display controls, with
+    query-mode pruning for table, AG Grid and Handlebars charts. Viewer-writable
+    query context cannot add labels. Raw names resolve against the dataset's
+    stored column and saved-metric ``verbose_name`` attributes. An entry is
+    omitted when no label is configured. Expressions are never parsed: columns
+    appearing only inside an expression, aggregate or filter, and dataset fields
+    absent from the recognized controls are excluded. No external metadata is
+    discovered.
+
+    :param datasource: The chart's SQLAlchemy dataset
+    :param chart: A chart whose datasource is ``datasource``
+    :param configured_labels: Optional dataset indexes shared by this request
+    :returns: Raw field/metric ID to display label, strings only
+    """
+    column_labels, metric_labels = (
+        configured_labels
+        if configured_labels is not None
+        else _dataset_display_labels(datasource)
+    )
+    labels: dict[str, str] = {}
+    # pylint: disable=protected-access
+    columns, metrics = datasource._slice_display_references(chart)
+    for references, stored_labels in (
+        (columns, column_labels),
+        (metrics, metric_labels),
+    ):
+        for reference in references:
+            if isinstance(reference, str):
+                if label := stored_labels.get(reference):
+                    labels.setdefault(reference, label)
+            elif isinstance(reference, dict):
+                if (
+                    stored_labels is column_labels
+                    and (column_name := _physical_display_column(reference))
+                    and (label := column_labels.get(column_name))
+                ):
+                    labels.setdefault(column_name, label)
+                elif label := _authored_adhoc_label(reference):
+                    labels.setdefault(label, label)
+    return labels
+
+
+class _ChartLabelAccess:  # pylint: disable=too-few-public-methods
+    """Decide which member charts of one dashboard may contribute labels.
+
+    Lives for a single ``datasets_trimmed_for_slices`` call, so nothing is
+    cached across requests. Chart authorization runs only when a chart has a
+    configured dataset label or an authored adhoc label to contribute.
+    """
+
+    def __init__(self, dashboard: Dashboard) -> None:
+        self._dashboard = dashboard
+        self._is_guest: bool | None = None
+        self._guest_granted = False
+
+    def allows(self, chart: Slice, *, datasource_access: bool) -> bool:
+        """Whether ``chart``, a member on its own SQLAlchemy dataset, may label.
+
+        :param chart: A member chart of the dashboard
+        :param datasource_access: This request's check for the chart's dataset
+        :returns: Whether the current user may see the chart's labels
+        """
+        if self._is_guest is None:
+            self._is_guest = bool(security_manager.is_guest_user())
+            if self._is_guest:
+                # The dashboard lookup already enforces this; never let a
+                # token for another dashboard read labels via a shared chart.
+                self._guest_granted = security_manager.has_guest_access(self._dashboard)
+            else:
+                # pylint: disable=import-outside-toplevel
+                from superset.daos.dashboard import DashboardDAO
+
+                DashboardDAO.prefetch_chart_access(self._dashboard)
+        return security_manager.can_access_dashboard_chart_labels(
+            self._dashboard,
+            chart,
+            guest_dashboard_access=self._guest_granted if self._is_guest else None,
+            datasource_access=datasource_access,
+        )
+
+
+class Dashboard(CoreDashboard, SoftDeleteMixin, AuditMixinNullable, ImportExportMixin):
+    """The dashboard object!"""
+
+    __tablename__ = "dashboards"
+    # SPIKE (full-Continuum): ``slices`` removed from
+    # the exclude list so Continuum auto-creates an association version table
+    # for ``dashboard_slices`` and ``Reverter(relations=["slices"])`` can
+    # restore chart membership. Owners / roles / editors / viewers stay
+    # excluded — access metadata, not user-authored content (ADR-005).
+    # Audit columns (changed_on/created_on/changed_by_fk/created_by_fk) are
+    # auto-bumped by AuditMixin on every save; excluding them lets Continuum's
+    # is_modified() return False on no-op saves (e.g. owners-only edits) so we
+    # don't create empty version rows. version_transaction.user_id /
+    # issued_at preserve "who/when" without per-row duplication.
+    # deleted_at is deletion-state metadata (SoftDeleteMixin), not user-authored
+    # content: it is tracked by soft delete, not by content versioning. It is also
+    # absent from the Continuum shadow table, so leaving it in would make every
+    # capture INSERT fail once soft delete is applied to dashboards.
+    __versioned__: dict[str, Any] = {
+        "exclude": [
+            "owners",
+            "roles",
+            "editors",
+            "viewers",
+            "changed_on",
+            "created_on",
+            "changed_by_fk",
+            "created_by_fk",
+            "deleted_at",
+        ]
+    }
+    id = Column(Integer, primary_key=True)
+    dashboard_title = Column(String(500))
+    position_json = Column(utils.MediumText())
+    description = Column(Text)
+    css = Column(utils.MediumText())
+    theme_id = Column(Integer, ForeignKey("themes.id"), nullable=True)
+    certified_by = Column(Text)
+    certification_details = Column(Text)
+    json_metadata = Column(utils.MediumText())
+    # Slug uniqueness is enforced via a partial unique index
+    # (``ix_dashboards_active_slug WHERE deleted_at IS NULL``) on
+    # PostgreSQL and MySQL 8.0.13+ (excluding MariaDB), so soft-deleted rows
+    # do not reserve their slug. SQLite, MariaDB, and MySQL <8.0.13 keep the
+    # original full unique constraint via the migration; on those dialects
+    # slug reservation persists across soft-delete. See the 9e1f3b8c4d2a
+    # migration for details.
+    slug = Column(String(255))
+    slices: list[Slice] = relationship(
+        Slice, secondary=dashboard_slices, backref="dashboards"
+    )
+    tags = relationship(
+        "Tag",
+        overlaps="objects,tag,tags",
+        secondary="tagged_object",
+        primaryjoin="and_(Dashboard.id == TaggedObject.object_id, "
+        "TaggedObject.object_type == 'dashboard')",
+        secondaryjoin="TaggedObject.tag_id == Tag.id",
+        viewonly=True,  # cascading deletion already handled by superset.tags.models.ObjectUpdater.after_delete  # noqa: E501
+    )
+    custom_tags = relationship(
+        "Tag",
+        overlaps="objects,tag,tags,custom_tags",
+        secondary="tagged_object",
+        primaryjoin="and_(Dashboard.id == TaggedObject.object_id, "
+        "TaggedObject.object_type == 'dashboard')",
+        secondaryjoin="and_(TaggedObject.tag_id == Tag.id, "
+        "cast(Tag.type, String) == 'custom')",  # Filtering at JOIN level
+        viewonly=True,
+    )
+    theme = relationship("Theme", foreign_keys=[theme_id])
+    published = Column(Boolean, default=False)
+    is_managed_externally = Column(Boolean, nullable=False, default=False)
+    external_url = Column(Text, nullable=True)
+    editors = relationship(
+        Subject,
+        secondary=dashboard_editors,
+        passive_deletes=True,
+    )
+    viewers = relationship(
+        Subject,
+        secondary=dashboard_viewers,
+        passive_deletes=True,
+    )
+
+    embedded = relationship(
+        "EmbeddedDashboard",
+        back_populates="dashboard",
+        cascade="all, delete-orphan",
+    )
+    export_fields = [
+        "dashboard_title",
+        "position_json",
+        "json_metadata",
+        "description",
+        "css",
+        "slug",
+        "certified_by",
+        "certification_details",
+        "published",
+    ]
+    extra_import_fields = ["is_managed_externally", "external_url", "theme_id"]
+
+    @classmethod
+    def _unique_constraints(cls) -> list[set[str]]:
+        """Import identity keys for ``import_from_dict``.
+
+        ``slug`` lost its column-level ``unique=True`` when the full unique
+        constraint was replaced by a partial (active-rows-only) index for
+        soft-delete. ``ImportExportMixin._unique_constraints`` derives import
+        lookup keys from unique columns/constraints, so without this override a
+        re-import whose UUID differs but whose ``slug`` matches an existing
+        active dashboard would no longer be matched-and-updated by slug — it
+        would fall through to an insert and collide on the partial active-slug
+        index at flush. Re-add ``{"slug"}`` here so import keeps matching by
+        slug (the pre-soft-delete behaviour) while DB-level uniqueness stays
+        partial. A ``NULL`` slug is skipped by the importer's filter builder,
+        so this only adds a real lookup when the imported config carries a slug.
+        """
+        constraints = super()._unique_constraints()
+        if {"slug"} not in constraints:
+            constraints.append({"slug"})
+        return constraints
+
+    def __repr__(self) -> str:
+        return f"Dashboard<{self.id or self.slug}>"
+
+    @property
+    def url(self) -> str:
+        return f"/dashboard/{self.slug or self.id}/"
+
+    @staticmethod
+    def get_url(id_: int, slug: str | None = None) -> str:
+        # To be able to generate URL's without instantiating a Dashboard object
+        return f"/dashboard/{slug or id_}/"
+
+    @property
+    def datasources(self) -> set[BaseDatasource]:
+        return {slc.datasource for slc in self.slices if slc.datasource}
+
+    def has_member_datasource(self, datasource: BaseDatasource | Explorable) -> bool:
+        """Type-aware membership: does a member chart reference this datasource?
+
+        A *member datasource* is the ``(datasource_type, datasource_id)``
+        pair a member chart references. Comparing the pair — never the bare
+        numeric id — makes the test immune to id collisions across
+        datasource types, and it needs no datasource resolution (zero
+        queries). ``datasources`` above stays table-shaped for its
+        export/thumbnail/dataset-payload consumers and must not be used for
+        membership checks: it silently omits every non-table datasource.
+        """
+        # ``type`` is duck-typed on purpose: drill entry points hand this
+        # method loosely-typed datasources, and an object with no type or no
+        # id is simply no member — fail closed. Ids are compared as-is: an
+        # explorable with a string id never matches the integer
+        # ``datasource_id`` column, which is likewise fail closed.
+        candidate_type: object = getattr(datasource, "type", None)
+        candidate_id: object = getattr(datasource, "id", None)
+        if candidate_type is None or candidate_id is None:
+            return False
+        return any(
+            (slc.datasource_type, slc.datasource_id) == (candidate_type, candidate_id)
+            for slc in self.slices
+        )
+
+    @property
+    def charts(self) -> list[str]:
+        return [slc.chart for slc in self.slices]
+
+    @property
+    def status(self) -> utils.DashboardStatus:
+        if self.published:
+            return utils.DashboardStatus.PUBLISHED
+        return utils.DashboardStatus.DRAFT
+
+    @renders("dashboard_title")
+    def dashboard_link(self) -> Markup:
+        title = escape(self.dashboard_title or "<empty>")
+        # FAB list view renders this raw HTML; use url_for so Flask prepends
+        # SCRIPT_NAME (the application_root) and the row link works under
+        # subdirectory deployments. `Dashboard.url` itself stays router-
+        # relative so frontend callers can apply ensureAppRoot exactly once.
+        # url_for percent-encodes the user-controlled slug path param; escape
+        # the result before Markup-marking for HTML attribute defence-in-depth.
+        href = escape(
+            url_for("Superset.dashboard", dashboard_id_or_slug=self.slug or self.id)
+        )
+        return Markup(f'<a href="{href}">{title}</a>')
+
+    @property
+    def digest(self) -> str | None:
+        return get_dashboard_digest(self)
+
+    @property
+    def thumbnail_url(self) -> str | None:
+        """
+        Returns a thumbnail URL with a HEX digest. We want to avoid browser cache
+        if the dashboard has changed
+        """
+        if digest := self.digest:
+            if not has_request_context():
+                # Out-of-request callers (CLI, celery tasks) have no
+                # SCRIPT_NAME to honor; keep the router-relative shape so
+                # the property stays callable anywhere.
+                return f"/api/v1/dashboard/{self.id}/thumbnail/{digest}/"
+            # url_for respects SCRIPT_NAME, so the URL carries the application
+            # root prefix under subdirectory deployments.
+            return url_for("DashboardRestApi.thumbnail", pk=self.id, digest=digest)
+
+        return None
+
+    @property
+    def changed_by_name(self) -> str:
+        if not self.changed_by:
+            return ""
+        return str(self.changed_by)
+
+    @property
+    def data(self) -> dict[str, Any]:
+        positions = self.position_json
+        if positions:
+            positions = json.loads(positions)
+        return {
+            "id": self.id,
+            "metadata": self.params_dict,
+            "certified_by": self.certified_by,
+            "certification_details": self.certification_details,
+            "css": self.css,
+            "dashboard_title": self.dashboard_title,
+            "published": self.published,
+            "slug": self.slug,
+            "slices": [slc.data for slc in self.slices],
+            "position_json": positions,
+            "last_modified_time": self.changed_on.replace(microsecond=0).timestamp(),
+            "is_managed_externally": self.is_managed_externally,
+        }
+
+    def datasets_trimmed_for_slices(
+        self,
+        *,
+        can_access_datasource: Callable[[BaseDatasource | SemanticView], bool]
+        | None = None,
+    ) -> list[tuple[BaseDatasource | SemanticView, dict[str, Any]]]:
+        """Return trimmed chart metadata, keeping datasource types distinct.
+
+        The endpoint supplies its request-local datasource check so label assembly
+        and metadata serialization share the same authorization decision.
+        """
+        # Key by (datasource_type, datasource_id): SqlaTable and SemanticView
+        # have independent auto-increment id spaces, so grouping by the bare
+        # datasource_id would merge unrelated datasources with colliding ids.
+        slices_by_datasource: dict[tuple[str, int], set[Slice]] = defaultdict(set)
+
+        semantic_layers_enabled: bool = is_semantic_layers_enabled()
+        for slc in self.slices:
+            if slc.datasource_type == "semantic_view" and not semantic_layers_enabled:
+                continue
+            slices_by_datasource[(slc.datasource_type, slc.datasource_id)].add(slc)
+
+        result: list[tuple[BaseDatasource | SemanticView, dict[str, Any]]] = []
+        label_access = _ChartLabelAccess(self)
+        datasource_access = (
+            can_access_datasource or security_manager.can_access_datasource
+        )
+
+        for _, slices in slices_by_datasource.items():
+            # Resolve once per typed datasource, retaining eager-loaded tables.
+            datasource: Datasource | None = next(iter(slices)).resolved_datasource
+
+            if isinstance(datasource, (BaseDatasource, SemanticView)):
+                if isinstance(datasource, SemanticView) and not datasource_access(
+                    datasource
+                ):
+                    # Keep the dashboard lookup identity without instantiating
+                    # a provider or discovering metadata with stored credentials.
+                    result.append(
+                        (
+                            datasource,
+                            {
+                                "id": datasource.id,
+                                "type": datasource.type,
+                                "name": datasource.name,
+                                "supports_samples": datasource.supports_samples,
+                                "supports_drill_to_detail": (
+                                    datasource.supports_drill_to_detail
+                                ),
+                            },
+                        )
+                    )
+                    continue
+                # Filter out unneeded fields from the datasource payload
+                try:
+                    payload: dict[str, Any] = dict(
+                        datasource.data_for_slices(list(slices))
+                    )
+                except AmbiguousDimensionError as ex:
+                    if not isinstance(datasource, SemanticView):
+                        raise
+                    # Expose only the host's validation diagnostic, after access.
+                    payload = {
+                        "id": datasource.id,
+                        "type": datasource.type,
+                        "name": datasource.name,
+                        "metadata_error": str(ex),
+                        "supports_samples": datasource.supports_samples,
+                        "supports_drill_to_detail": datasource.supports_drill_to_detail,
+                    }
+                except Exception as ex:  # noqa: BLE001
+                    if not isinstance(datasource, SemanticView):
+                        raise
+                    # Provider discovery must not hide other charts' metadata.
+                    # Providers have no shared operational exception contract.
+                    # Exception details may contain credentials or provider URLs.
+                    logger.warning(
+                        "Could not serialize semantic view id=%s "
+                        "layer_uuid=%s error=%s",
+                        datasource.id,
+                        datasource.semantic_layer_uuid,
+                        type(ex).__name__,
+                    )
+                    continue
+                result.append(
+                    (
+                        datasource,
+                        self._with_chart_display_labels(
+                            datasource,
+                            slices,
+                            payload,
+                            label_access,
+                            can_access_datasource=datasource_access,
+                        ),
+                    )
+                )
+
+        return result
+
+    def _with_chart_display_labels(
+        self,
+        datasource: BaseDatasource | SemanticView,
+        slices: set[Slice],
+        payload: dict[str, Any],
+        access: _ChartLabelAccess,
+        *,
+        can_access_datasource: Callable[[BaseDatasource | SemanticView], bool]
+        | None = None,
+    ) -> dict[str, Any]:
+        """Add display labels of this dashboard's accessible member charts.
+
+        Only SQLAlchemy datasets get ``chart_display_labels``, and only this
+        dashboard's own member charts on ``datasource`` that the caller may
+        access contribute, each limited to its saved dimensions and metrics.
+        Nothing is taken from the request. Callers with datasource access keep
+        the existing verbose map and skip label assembly and chart authorization.
+        Callers without that access see authorized chart labels only. The key is
+        omitted when no label is authorized.
+
+        :param datasource: The datasource shared by ``slices``
+        :param slices: Member charts of this dashboard on ``datasource``
+        :param payload: The trimmed datasource payload, updated in place
+        :param access: This request's chart authorization for labels
+        :param can_access_datasource: This request's shared datasource check
+        :returns: ``payload``
+        """
+        if not isinstance(datasource, SqlaTable):
+            return payload
+        datasource_access = (
+            can_access_datasource or security_manager.can_access_datasource
+        )
+        if datasource_access(datasource):
+            return payload
+
+        configured_labels = _dataset_display_labels(datasource)
+        verbose_map = payload.get("verbose_map", {})
+        labels: dict[str, dict[str, str]] = {}
+        for chart in sorted(slices, key=lambda slc: slc.id or 0):
+            if (
+                chart.id is None
+                or chart.datasource_type != utils.DatasourceType.TABLE
+                or chart.datasource_id != datasource.id
+            ):
+                continue
+            # Building the labels reads stored metadata only, so the access
+            # check runs just for charts that would contribute an entry.
+            chart_labels = saved_chart_display_labels(
+                datasource, chart, configured_labels=configured_labels
+            )
+            # A raw ID can collide with another chart's saved field or authored
+            # label. Omit conflicting labels rather than expose a different
+            # field's display name or disagree with the full-access payload.
+            chart_labels = {
+                name: label
+                for name, label in chart_labels.items()
+                if verbose_map.get(name) == label
+            }
+            if chart_labels and access.allows(chart, datasource_access=False):
+                labels[str(chart.id)] = chart_labels
+        if labels:
+            payload["chart_display_labels"] = labels
+        return payload
+
+    @property
+    def params(self) -> str:
+        return self.json_metadata
+
+    @params.setter
+    def params(self, value: str) -> None:
+        self.json_metadata = value
+
+    @property
+    def position(self) -> dict[str, Any]:
+        if self.position_json:
+            return json.loads(self.position_json)
+        return {}
+
+    @property
+    def tabs(self) -> dict[str, Any]:  # noqa: C901
+        # Callers index ``all_tabs`` and iterate ``tab_tree``, so every exit
+        # returns that shape. A bare ``{}`` reaches the API as a payload with
+        # neither key, which a caller cannot iterate.
+        no_tabs: dict[str, Any] = {"all_tabs": {}, "tab_tree": []}
+        if not isinstance(self.position, dict):
+            logger.warning("Dashboard %s: layout is not a mapping", self.id)
+            return no_tabs
+        if self.position == {}:
+            return no_tabs
+
+        def get_node(node_id: str) -> Optional[dict[str, Any]]:
+            """
+            Helper function for getting a node from the position_data
+            """
+            return self.position.get(node_id)
+
+        def resolve_child(child_id: Any) -> Optional[dict[str, Any]]:
+            """
+            Helper function for reading a child id, or None if it cannot be walked
+            """
+            child = get_node(child_id) if isinstance(child_id, str) else None
+            if not isinstance(child, dict):
+                logger.warning(
+                    "Dashboard %s: skipping layout node %s, missing or malformed",
+                    self.id,
+                    child_id,
+                )
+                return None
+            if child_id in visited:
+                logger.warning(
+                    "Dashboard %s: skipping layout node %s, the layout reaches "
+                    "it more than once",
+                    self.id,
+                    child_id,
+                )
+                return None
+            visited.add(child_id)
+            return child
+
+        def register_tab(node: dict[str, Any]) -> None:
+            """
+            Helper function for titling a TAB node and adding it to all_tabs
+            """
+            meta = node.get("meta")
+            title = meta.get("text") if isinstance(meta, dict) else None
+            if not isinstance(title, str):
+                logger.warning(
+                    "Dashboard %s: tab node %s has no title in the layout",
+                    self.id,
+                    node.get("id"),
+                )
+                title = ""
+            node["title"] = title
+            node_id = node.get("id")
+            if not isinstance(node_id, str):
+                logger.warning(
+                    "Dashboard %s: skipping tab node with no usable id in the layout",
+                    self.id,
+                )
+                return
+            node["value"] = node_id
+            all_tabs[node_id] = title
+
+        def build_tab_tree(
+            node: dict[str, Any], children: list[dict[str, Any]]
+        ) -> None:
+            """
+            Function for building the tab tree structure and list of all tabs
+            """
+            if "type" not in node:
+                logger.warning(
+                    "Dashboard %s: skipping untyped layout node %s",
+                    self.id,
+                    node.get("id"),
+                )
+                return
+
+            # A node whose type is not one of the four below is walked through
+            # without contributing to the tree, exactly as an untabbed layout
+            # element always has been.
+            node_type = node["type"]
+            child_ids = node.get("children", [])
+            if not isinstance(child_ids, list):
+                logger.warning(
+                    "Dashboard %s: layout node %s has malformed children",
+                    self.id,
+                    node.get("id"),
+                )
+                child_ids = []
+            new_children: list[dict[str, Any]] = []
+            # new children to overwrite parent's children
+            for child_id in child_ids:
+                child = resolve_child(child_id)
+                if child is None:
+                    continue
+                if node_type == "TABS":
+                    # Only a node that will register as a tab belongs in the
+                    # tree. Anything else -- an untyped node, or a tab whose id
+                    # cannot key ``all_tabs`` -- is rejected later and would be
+                    # left in the tree with no ``value`` and no ``title``. It is
+                    # still walked, so tabs stored below it are not lost.
+                    if child.get("type") == "TAB" and isinstance(child.get("id"), str):
+                        children.append(child)
+                    else:
+                        logger.warning(
+                            "Dashboard %s: keeping layout node %s out of the "
+                            "tab tree, it is not a usable tab",
+                            self.id,
+                            child_id,
+                        )
+                    queue.append((child, new_children))
+                elif node_type in ["GRID", "ROOT"]:
+                    queue.append((child, children))
+                elif node_type == "TAB":
+                    queue.append((child, new_children))
+            if node_type == "TAB":
+                node["children"] = new_children
+                register_tab(node)
+
+        root = get_node("ROOT_ID")
+        if not isinstance(root, dict):
+            logger.warning("Dashboard %s: layout has no usable ROOT_ID node", self.id)
+            return no_tabs
+
+        tab_tree: list[dict[str, Any]] = []
+        all_tabs: dict[str, str] = {}
+        # A layout is a tree, so every node is reached once. A stored layout
+        # that reaches one twice would walk it twice, and a cycle would never
+        # stop, so the walk keeps track of what it has already reached.
+        visited: set[str] = {"ROOT_ID"}
+        queue: deque[tuple[dict[str, Any], list[dict[str, Any]]]] = deque()
+        queue.append((root, tab_tree))
+        while queue:
+            node, children = queue.popleft()
+            build_tab_tree(node, children)
+
+        return {"all_tabs": all_tabs, "tab_tree": tab_tree}
+
+    def update_thumbnail(self) -> None:
+        cache_dashboard_thumbnail.delay(
+            current_user=get_current_user(),
+            dashboard_id=self.id,
+            force=True,
+        )
+
+    @classmethod
+    def export_dashboards(  # pylint: disable=too-many-locals
+        cls,
+        dashboard_ids: set[int],
+    ) -> str:
+        copied_dashboards = []
+        datasource_ids = set()
+        for dashboard_id in dashboard_ids:
+            # make sure that dashboard_id is an integer
+            dashboard_id = int(dashboard_id)
+            dashboard = (
+                db.session.query(Dashboard)
+                .options(subqueryload(Dashboard.slices))
+                .filter_by(id=dashboard_id)
+                .first()
+            )
+            # remove ids and relations (like editors, created by, slices, ...)
+            copied_dashboard = dashboard.copy()
+            for slc in dashboard.slices:
+                datasource_ids.add((slc.datasource_id, slc.datasource_type))
+                copied_slc = slc.copy()
+                # save original id into json
+                # we need it to update dashboard's json metadata on import
+                copied_slc.id = slc.id
+                # add extra params for the import
+                copied_slc.alter_params(
+                    remote_id=slc.id,
+                    datasource_name=slc.datasource.datasource_name,
+                    schema=slc.datasource.schema,
+                    database_name=slc.datasource.database.name,
+                )
+                # set slices without creating ORM relations
+                slices = copied_dashboard.__dict__.setdefault("slices", [])
+                slices.append(copied_slc)
+
+            json_metadata = json.loads(dashboard.json_metadata)
+            native_filter_configuration: list[dict[str, Any]] = json_metadata.get(
+                "native_filter_configuration", []
+            )
+            for native_filter in native_filter_configuration:
+                for target in native_filter.get("targets", []):
+                    id_ = target.get("datasetId")
+                    if id_ is None:
+                        continue
+                    datasource = DatasourceDAO.get_datasource(
+                        utils.DatasourceType.TABLE, id_
+                    )
+                    datasource_ids.add((datasource.id, datasource.type))
+
+            copied_dashboard.alter_params(remote_id=dashboard_id)
+            copied_dashboards.append(copied_dashboard)
+
+        datasource_id_list = list(datasource_ids)
+        datasource_id_list.sort()
+
+        eager_datasources = []
+        for datasource_id, _ in datasource_id_list:
+            eager_datasource = SqlaTable.get_eager_sqlatable_datasource(datasource_id)
+            copied_datasource = eager_datasource.copy()
+            copied_datasource.alter_params(
+                remote_id=eager_datasource.id,
+                database_name=eager_datasource.database.name,
+            )
+            eager_datasources.append(copied_datasource)
+
+        return json.dumps(
+            {"dashboards": copied_dashboards, "datasources": eager_datasources},
+            cls=json.DashboardEncoder,
+            indent=4,
+        )
+
+    @classmethod
+    def get(cls, id_or_slug: str | int) -> Dashboard:
+        qry = db.session.query(Dashboard).filter(id_or_slug_filter(id_or_slug))
+        return qry.one_or_none()
+
+    def raise_for_access(self) -> None:
+        """
+        Raise an exception if the user cannot access the resource.
+
+        :raises SupersetSecurityException: If the user cannot access the resource
+        """
+
+        security_manager.raise_for_access(dashboard=self)
+
+
+def is_uuid(value: str | int) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def is_int(value: str | int) -> bool:
+    try:
+        int(value)
+        return True
+    except ValueError:
+        return False
+
+
+def id_or_slug_filter(id_or_slug: int | str) -> BinaryExpression:
+    if is_int(id_or_slug):
+        return Dashboard.id == int(id_or_slug)
+    if is_uuid(id_or_slug):
+        return Dashboard.uuid == uuid.UUID(str(id_or_slug))
+    return Dashboard.slug == id_or_slug
+
+
+OnDashboardChange = Callable[[Mapper, Connection, Dashboard], Any]
+
+if is_feature_enabled("THUMBNAILS_SQLA_LISTENERS"):
+    update_thumbnail: OnDashboardChange = lambda _, __, dash: dash.update_thumbnail()  # noqa: E731
+    sqla.event.listen(Dashboard, "after_insert", update_thumbnail)
+    sqla.event.listen(Dashboard, "after_update", update_thumbnail)
